@@ -1,0 +1,13 @@
+PyQt6>=6.6.0
+PyQt6-Qt6>=6.6.0
+Pillow>=10.0.0
+# SMTC API (управление медиасессиями Windows).
+# Сначала пробуем новые per-namespace пакеты winrt-* (рекомендуется),
+# затем старый монолитный winsdk как fallback.
+# На Python 3.13+ ставьте winrt-* (winsdk может не собираться).
+winrt-Windows.Media.Control>=2.0.0; sys_platform == "win32"
+winrt-Windows.Storage.Streams>=2.0.0; sys_platform == "win32"
+winrt-Windows.Foundation>=2.0.0; sys_platform == "win32"
+# Опционально: для управления громкостью приложения
+pycaw>=20230407; sys_platform == "win32"
+comtypes>=1.2.0; sys_platform == "win32"
