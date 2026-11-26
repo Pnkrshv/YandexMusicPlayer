@@ -1,15 +1,20 @@
 """
-styles.py — Стилизация под Windows 11 (без Mica).
+styles.py — Стилизация под Windows 11 + размытие фона (Acrylic / Blur).
 
-Палитра двух тем, QSS-таблица, SVG-иконки, генератор плейсхолдера обложки.
-Функция apply_mica() оставлена «на всякий случай», но виджет её не вызывает:
-из-за DwmExtendFrameIntoClientArea(-1) она рисовала тёмную подложку на всё
-окно, из-за чего за карточкой была видна тёмная рамка.
+Размытие делается напрямую через WinAPI (ctypes), без сторонних библиотек:
+SetWindowCompositionAttribute + ACCENT_ENABLE_ACRYLICBLURBEHIND.
+Это совместимо с Qt-окном WA_TranslucentBackground, которое нужно для
+скруглённых углов и прозрачных полей.
+
+ВАЖНО: DwmExtendFrameIntoClientArea(-1) здесь НЕ используется —
+именно он рисовал тёмную подложку под карточкой.
 """
 
 from __future__ import annotations
 
+import ctypes
 import sys
+
 from PyQt6.QtCore import Qt, QByteArray
 from PyQt6.QtGui import QColor, QIcon, QPainter, QPixmap, QPen, QBrush
 from PyQt6.QtSvg import QSvgRenderer
@@ -17,24 +22,26 @@ from PyQt6.QtWidgets import QApplication, QWidget
 
 
 # --------------------------------------------------------------------------- #
-#  Палитра (сплошные цвета — карточка непрозрачная)
+#  Палитры (базовые — сплошные цвета, используются если размытие недоступно)
 # --------------------------------------------------------------------------- #
 
 WIN11_LIGHT = {
     "bg":           "transparent",
-    "surface":      "#FFFFFF",
-    "surface_alt":  "#F5F5F7",
+    "surface":      "#F3F3F3",
+    "surface_alt":  "#E6E6E8",
+    "cover_bg":     "#E4E4E8",
     "text":         "#1A1A1A",
     "text_alt":     "#5B5B5B",
     "accent":       "#0067C0",
     "accent_hover": "#005A9E",
-    "border":       "#E5E5E7",
+    "border":       "#DCDCDE",
 }
 
 WIN11_DARK = {
-    "bg":           "#202020",
-    "surface":      "#252528",
-    "surface_alt":  "#323236",
+    "bg":           "transparent",
+    "surface":      "#2B2B2E",
+    "surface_alt":  "#3A3A3E",
+    "cover_bg":     "#38383C",
     "text":         "#FFFFFF",
     "text_alt":     "#C5C5C8",
     "accent":       "#4CC2FF",
@@ -42,15 +49,53 @@ WIN11_DARK = {
     "border":       "#3F3F44",
 }
 
+# Режим фона: "none" | "blur" | "acrylic". Выставляется из виджета.
+_BLUR_MODE = "none"
+
+
+def set_blur_mode(mode: str) -> None:
+    global _BLUR_MODE
+    _BLUR_MODE = mode if mode in ("none", "blur", "acrylic") else "none"
+
+
+def blur_mode() -> str:
+    return _BLUR_MODE
+
+
+def _is_dark() -> bool:
+    try:
+        return QApplication.styleHints().colorScheme() == Qt.ColorScheme.Dark
+    except Exception:
+        return False
+
 
 def palette() -> dict:
-    try:
-        scheme = QApplication.styleHints().colorScheme()
-        if scheme == Qt.ColorScheme.Dark:
-            return WIN11_DARK
-    except Exception:
-        pass
-    return WIN11_LIGHT
+    """Возвращает палитру с учётом темы и доступности размытия."""
+    dark = _is_dark()
+    p = dict(WIN11_DARK if dark else WIN11_LIGHT)
+
+    if _BLUR_MODE == "acrylic":
+        # Акриллик сам даёт тонировку — карточка почти прозрачная
+        if dark:
+            p["surface"]     = "rgba(43, 43, 46, 70)"
+            p["surface_alt"] = "rgba(255, 255, 255, 36)"
+            p["border"]      = "rgba(255, 255, 255, 45)"
+        else:
+            p["surface"]     = "rgba(249, 249, 249, 70)"
+            p["surface_alt"] = "rgba(0, 0, 0, 20)"
+            p["border"]      = "rgba(0, 0, 0, 25)"
+    elif _BLUR_MODE == "blur":
+        # Обычный blur без тонировки — тонируем сами
+        if dark:
+            p["surface"]     = "rgba(37, 37, 40, 175)"
+            p["surface_alt"] = "rgba(255, 255, 255, 40)"
+            p["border"]      = "rgba(255, 255, 255, 50)"
+        else:
+            p["surface"]     = "rgba(249, 249, 249, 185)"
+            p["surface_alt"] = "rgba(0, 0, 0, 22)"
+            p["border"]      = "rgba(0, 0, 0, 28)"
+
+    return p
 
 
 # --------------------------------------------------------------------------- #
@@ -60,7 +105,7 @@ def palette() -> dict:
 def build_qss(p: dict) -> str:
     return f"""
     QWidget#WidgetRoot {{
-        background: {p['bg']};
+        background: transparent;
     }}
 
     QFrame#Card {{
@@ -104,6 +149,7 @@ def build_qss(p: dict) -> str:
     QPushButton#CtrlButton {{
         background: transparent;
         border: none;
+        border-radius: 14px;
         color: {p['text']};
         padding: 0;
     }}
@@ -120,7 +166,7 @@ def build_qss(p: dict) -> str:
     QPushButton#PlayButton {{
         background: {p['accent']};
         border: none;
-        border-radius: 22px;
+        border-radius: 20px;
         color: white;
     }}
     QPushButton#PlayButton:hover {{
@@ -236,16 +282,17 @@ def svg_to_pixmap(svg: str, size: int = 64) -> QPixmap:
 
 def make_placeholder_cover(text: str = "♪", size: int = 120) -> QPixmap:
     p = palette()
+    bg = QColor(p["cover_bg"])          # всегда сплошной цвет — QColor-safe
     pixmap = QPixmap(size, size)
-    pixmap.fill(QColor(p["surface_alt"]))
+    pixmap.fill(Qt.GlobalColor.transparent)
     painter = QPainter(pixmap)
     painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-    painter.setPen(QPen(QColor(p["accent"]), 2))
-    painter.setBrush(QBrush(QColor(p["surface_alt"])))
-    painter.drawRoundedRect(2, 2, size - 4, size - 4, 12, 12)
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.setBrush(QBrush(bg))
+    painter.drawRoundedRect(0, 0, size, size, size * 0.13, size * 0.13)
     painter.setPen(QColor(p["text_alt"]))
     font = painter.font()
-    font.setPointSize(max(20, size // 3))
+    font.setPointSize(max(12, size // 3))
     painter.setFont(font)
     painter.drawText(pixmap.rect(), Qt.AlignmentFlag.AlignCenter, text)
     painter.end()
@@ -253,59 +300,125 @@ def make_placeholder_cover(text: str = "♪", size: int = 120) -> QPixmap:
 
 
 # --------------------------------------------------------------------------- #
-#  Mica (не используется, оставлено на будущее)
+#  Размытие фона через WinAPI (без сторонних библиотек)
 # --------------------------------------------------------------------------- #
 
-def apply_mica(widget: QWidget, dark: bool | None = None) -> bool:
-    if sys.platform != "win32":
-        return False
+_WCA_ACCENT_POLICY = 19
+_ACCENT_ENABLE_BLURBEHIND = 3
+_ACCENT_ENABLE_ACRYLICBLURBEHIND = 4
+_DWMWA_USE_IMMERSIVE_DARK_MODE = 20
+
+
+class _ACCENT_POLICY(ctypes.Structure):
+    _fields_ = [
+        ("AccentState", ctypes.c_int),
+        ("AccentFlags", ctypes.c_int),
+        ("GradientColor", ctypes.c_uint),
+        ("AnimationId", ctypes.c_int),
+    ]
+
+
+class _WINCOMPATTRDATA(ctypes.Structure):
+    _fields_ = [
+        ("Attribute", ctypes.c_int),
+        ("Data", ctypes.c_void_p),
+        ("SizeOfData", ctypes.c_size_t),
+    ]
+
+
+def _argb(alpha: int, r: int, g: int, b: int) -> int:
+    """GradientColor хранится как 0xAABBGGRR."""
+    return (alpha << 24) | (b << 16) | (g << 8) | r
+
+
+def _set_accent(hwnd: int, state: int, gradient: int = 0) -> bool:
     try:
-        import ctypes
+        user32 = ctypes.windll.user32
+        fn = getattr(user32, "SetWindowCompositionAttribute", None)
+        if fn is None:
+            return False
+        fn.argtypes = [ctypes.c_void_p, ctypes.POINTER(_WINCOMPATTRDATA)]
+        fn.restype = ctypes.c_int
 
-        DWMWA_USE_IMMERSIVE_DARK_MODE = 20
-        DWMWA_SYSTEMBACKDROP_TYPE = 38
-        DWMSBT_MAINWINDOW = 2
+        accent = _ACCENT_POLICY(state, 0, gradient, 0)
+        data = _WINCOMPATTRDATA(
+            _WCA_ACCENT_POLICY,
+            ctypes.cast(ctypes.pointer(accent), ctypes.c_void_p),
+            ctypes.sizeof(accent),
+        )
+        return bool(fn(ctypes.c_void_p(hwnd), ctypes.byref(data)))
+    except Exception as e:
+        print(f"[styles] _set_accent({state}) failed: {e}", file=sys.stderr)
+        return False
 
+
+def apply_blur(widget: QWidget, dark: bool | None = None) -> str:
+    """
+    Включает размытие под окном. Возвращает применённый режим:
+      "acrylic" — акриллик с тонировкой (Win10 1803+ / Win11)
+      "blur"    — обычное размытие (Win10 / Win7 Aero)
+      "none"    — размытие недоступно, палитра станет непрозрачной
+    """
+    if sys.platform != "win32":
+        return "none"
+
+    try:
         hwnd = int(widget.winId())
 
         if dark is None:
-            try:
-                dark = QApplication.styleHints().colorScheme() == Qt.ColorScheme.Dark
-            except Exception:
-                dark = False
+            dark = _is_dark()
 
-        ctypes.windll.dwmapi.DwmSetWindowAttribute(
-            hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE,
-            ctypes.byref(ctypes.c_int(1 if dark else 0)),
-            ctypes.sizeof(ctypes.c_int),
-        )
-        ctypes.windll.dwmapi.DwmSetWindowAttribute(
-            hwnd, DWMWA_SYSTEMBACKDROP_TYPE,
-            ctypes.byref(ctypes.c_int(DWMSBT_MAINWINDOW)),
-            ctypes.sizeof(ctypes.c_int),
-        )
+        # Тёмный режим системной рамки (на всякий случай, без расширения рамки)
+        try:
+            val = ctypes.c_int(1 if dark else 0)
+            ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                hwnd, _DWMWA_USE_IMMERSIVE_DARK_MODE,
+                ctypes.byref(val), ctypes.sizeof(val),
+            )
+        except Exception:
+            pass
 
-        class MARGINS(ctypes.Structure):
-            _fields_ = [
-                ("cxLeftWidth", ctypes.c_int), ("cxRightWidth", ctypes.c_int),
-                ("cyTopHeight", ctypes.c_int), ("cyBottomHeight", ctypes.c_int),
-            ]
+        # Тонировка акрилла: 0x99 ≈ 60 % непрозрачности
+        tint = _argb(0x99, 0x20, 0x20, 0x22) if dark else _argb(0x99, 0xF9, 0xF9, 0xF9)
 
-        margins = MARGINS(-1)
-        ctypes.windll.dwmapi.DwmExtendFrameIntoClientArea(hwnd, ctypes.byref(margins))
-        return True
+        if _set_accent(hwnd, _ACCENT_ENABLE_ACRYLICBLURBEHIND, tint):
+            return "acrylic"
+
+        if _set_accent(hwnd, _ACCENT_ENABLE_BLURBEHIND, 0):
+            return "blur"
+
     except Exception as e:
-        print(f"[styles.apply_mica] не удалось: {e}", file=sys.stderr)
-        return False
+        print(f"[styles.apply_blur] не удалось: {e}", file=sys.stderr)
+
+    return "none"
+
+
+def round_window(widget: QWidget, radius: int = 16) -> None:
+    """
+    Обрезает окно скруглённым прямоугольником, чтобы размытие не торчало
+    квадратом за пределами карточки. Учитывает DPI.
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        hwnd = int(widget.winId())
+        dpr = widget.devicePixelRatioF() or 1.0
+        w = int(widget.width() * dpr)
+        h = int(widget.height() * dpr)
+        r = int(radius * dpr)
+        rgn = ctypes.windll.gdi32.CreateRoundRectRgn(0, 0, w + 1, h + 1, r * 2, r * 2)
+        if rgn:
+            # После SetWindowRgn регион принадлежит системе — удалять не нужно
+            ctypes.windll.user32.SetWindowRgn(ctypes.c_void_p(hwnd),
+                                              ctypes.c_void_p(rgn), True)
+    except Exception as e:
+        print(f"[styles.round_window] не удалось: {e}", file=sys.stderr)
 
 
 def is_windows_11() -> bool:
     if sys.platform != "win32":
         return False
     try:
-        import platform
-        ver = platform.win32_ver()
-        build = int(ver[1].split(".")[-1]) if ver[1] else 0
-        return build >= 22000
+        return sys.getwindowsversion().build >= 22000
     except Exception:
         return False

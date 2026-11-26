@@ -1,16 +1,9 @@
 """
 widget.py — Виджет панели задач Windows 11 для управления Яндекс Музыкой.
 
-Исправления:
-- Кнопки next/prev/play всегда активны, если есть трек (SMTC может
-  отдавать can_next=False, но fallback-медиа-клавиша всё равно сработает).
-- Прогресс-бар скрывается, когда duration == 0.
-- UI сбрасывается только по session_changed(False).
-- Управление громкостью: расширенный матчинг имени процесса (латиница +
-  кириллица), кэширование ISimpleAudioVolume, синхронизация слайдера
-  с реальной громкостью при подключении.
+Фон: настоящее размытие (Acrylic) через WinAPI из styles.apply_blur().
+Сторонние библиотеки не требуются.
 """
-
 from __future__ import annotations
 
 import logging
@@ -27,7 +20,7 @@ from PyQt6.QtWidgets import (
 
 from .styles import (
     palette, build_qss, svg_to_icon, make_placeholder_cover,
-    apply_mica,
+    apply_blur, set_blur_mode, blur_mode, round_window,
     SVG_PLAY, SVG_PAUSE, SVG_NEXT, SVG_PREV, SVG_CLOSE,
     SVG_VOLUME, SVG_VOLUME_MUTE,
 )
@@ -35,17 +28,11 @@ from .smtc import SmtcController, TrackInfo
 
 log = logging.getLogger("yandex_widget.widget")
 
-
-# Подсказки для поиска процесса Яндекс Музыки в аудио-сессиях.
-# Включены как латинские, так и кириллические варианты, потому что
-# установщик с music.yandex.ru создаёт процесс «Яндекс Музыка.exe».
 YANDEX_PROCESS_HINTS = (
-    "yandex",    # yandex-music.exe, YandexMusic.exe
-    "music",     # music.exe, ymusic.exe
-    "ymusic",    # ymusic.exe
-    "яндекс",    # Яндекс Музыка.exe
-    "музык",     # ... музыка.exe
+    "yandex", "music", "ymusic", "яндекс", "музык",
 )
+
+CARD_RADIUS = 16
 
 
 class TaskbarWidget(QWidget):
@@ -57,23 +44,33 @@ class TaskbarWidget(QWidget):
         self._smtc = smtc
         self._drag_pos: Optional[QPoint] = None
         self._user_seeking = False
-        self._volume_ctl = None  # кэш ISimpleAudioVolume
+        self._volume_ctl = None
         self._pycaw_warned = False
+        self._last_volume = 70
 
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint
             | Qt.WindowType.Tool
             | Qt.WindowType.WindowStaysOnTopHint
         )
+        # Обязательно для скруглённых углов и прозрачных полей
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setFixedSize(self.WIDTH, self.HEIGHT)
         self.setObjectName("WidgetRoot")
 
         self._build_ui()
+
+        # --- Размытие фона ---
+        mode = apply_blur(self)
+        set_blur_mode(mode)
+        log.info("Режим фона: %s", mode)
+
         self._apply_styles()
         self._connect_signals()
         self._position_near_taskbar()
-        self._mica_applied = apply_mica(self)
+
+        # Обрезаем окно по скруглению карточки
+        round_window(self, CARD_RADIUS)
 
         self._fade_in = QPropertyAnimation(self, b"windowOpacity")
         self._fade_in.setDuration(180)
@@ -81,23 +78,22 @@ class TaskbarWidget(QWidget):
     # ------------------------------------------------------------------ #
     #  UI
     # ------------------------------------------------------------------ #
-
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
-        root.setContentsMargins(14, 14, 14, 14)
-        root.setSpacing(8)
+        # Отступов нет: карточка занимает всё окно, углы обрезает SetWindowRgn
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
 
         card = QFrame()
         card.setObjectName("Card")
         card_layout = QVBoxLayout(card)
-        card_layout.setContentsMargins(16, 14, 16, 14)
+        card_layout.setContentsMargins(16, 12, 16, 14)
         card_layout.setSpacing(6)
 
         # --- Верхняя строка ---
         top = QHBoxLayout()
         brand = QLabel("Яндекс Музыка")
-        brand.setObjectName("CaptionLabel")
-        brand.setStyleSheet("font-weight: 600;")
+        brand.setObjectName("BrandLabel")
         top.addWidget(brand)
         top.addStretch()
 
@@ -109,7 +105,7 @@ class TaskbarWidget(QWidget):
         close_btn = QPushButton()
         close_btn.setObjectName("IconButton")
         close_btn.setFixedSize(24, 24)
-        close_btn.setIcon(svg_to_icon(SVG_CLOSE, 12, color="#5B5B5B"))
+        close_btn.setIcon(svg_to_icon(SVG_CLOSE, 12, color="#8A8A8A"))
         close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         close_btn.clicked.connect(self.hide)
         top.addWidget(close_btn)
@@ -121,9 +117,9 @@ class TaskbarWidget(QWidget):
 
         self.cover_lbl = QLabel()
         self.cover_lbl.setFixedSize(64, 64)
-        self.cover_lbl.setPixmap(make_placeholder_cover())
+        self.cover_lbl.setPixmap(make_placeholder_cover("♪", 64))
         self.cover_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.cover_lbl.setStyleSheet("background: transparent; border-radius: 8px;")
+        self.cover_lbl.setStyleSheet("background: transparent;")
         middle.addWidget(self.cover_lbl, alignment=Qt.AlignmentFlag.AlignTop)
 
         info_col = QVBoxLayout()
@@ -136,19 +132,20 @@ class TaskbarWidget(QWidget):
 
         self.artist_lbl = QLabel("Запустите приложение Яндекс Музыки")
         self.artist_lbl.setObjectName("TrackArtist")
+        self.artist_lbl.setWordWrap(True)
         info_col.addWidget(self.artist_lbl)
 
         self.app_lbl = QLabel("")
         self.app_lbl.setObjectName("StatusLabel")
         info_col.addWidget(self.app_lbl)
-
         info_col.addStretch()
+
         middle.addLayout(info_col, 1)
         card_layout.addLayout(middle)
 
-        # --- Прогресс (в контейнере, чтобы скрывать целиком) ---
+        # --- Прогресс ---
         self.progress_container = QWidget()
-        self.progress_container.setContentsMargins(0, 0, 0, 0)
+        self.progress_container.setStyleSheet("background: transparent;")
         progress_row = QHBoxLayout(self.progress_container)
         progress_row.setContentsMargins(0, 0, 0, 0)
         progress_row.setSpacing(6)
@@ -197,7 +194,6 @@ class TaskbarWidget(QWidget):
         self.volume_slider.setFixedHeight(14)
         self.volume_slider.valueChanged.connect(self._on_volume_changed)
         controls.addWidget(self.volume_slider)
-
         controls.addStretch()
 
         self.prev_btn = self._make_ctrl_button(SVG_PREV, 28, "Предыдущий трек")
@@ -216,13 +212,10 @@ class TaskbarWidget(QWidget):
         self.next_btn = self._make_ctrl_button(SVG_NEXT, 28, "Следующий трек")
         self.next_btn.clicked.connect(self._smtc.next)
         controls.addWidget(self.next_btn)
-
         controls.addStretch()
 
-        spacer = QSpacerItem(28, 28, QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
-        controls.addItem(spacer)
-        spacer2 = QSpacerItem(56, 28, QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
-        controls.addItem(spacer2)
+        controls.addItem(QSpacerItem(28, 28, QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed))
+        controls.addItem(QSpacerItem(56, 28, QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed))
 
         card_layout.addLayout(controls)
         root.addWidget(card)
@@ -239,22 +232,11 @@ class TaskbarWidget(QWidget):
         return btn
 
     def _apply_styles(self) -> None:
-        p = palette()
-        self.setStyleSheet(
-            build_qss(p)
-            + f"""
-            QFrame#Card {{
-                background: {p['surface']};
-                border: 1px solid {p['border']};
-                border-radius: 12px;
-            }}
-            """
-        )
+        self.setStyleSheet(build_qss(palette()))
 
     # ------------------------------------------------------------------ #
     #  Сигналы SMTC
     # ------------------------------------------------------------------ #
-
     def _connect_signals(self) -> None:
         self._smtc.track_changed.connect(self._on_track_changed)
         self._smtc.state_changed.connect(self._on_state_changed)
@@ -268,7 +250,7 @@ class TaskbarWidget(QWidget):
             self.title_lbl.setText("Нет воспроизведения")
             self.artist_lbl.setText("Запустите приложение Яндекс Музыки")
             self.app_lbl.setText("")
-            self.cover_lbl.setPixmap(make_placeholder_cover())
+            self.cover_lbl.setPixmap(make_placeholder_cover("♪", 64))
             self.play_btn.setIcon(svg_to_icon(SVG_PLAY, 20, color="#FFFFFF"))
             self.play_btn.setEnabled(False)
             self.prev_btn.setEnabled(False)
@@ -286,12 +268,11 @@ class TaskbarWidget(QWidget):
         if track.thumbnail:
             self._set_cover_from_bytes(track.thumbnail)
         else:
-            self.cover_lbl.setPixmap(make_placeholder_cover())
+            self.cover_lbl.setPixmap(make_placeholder_cover("♪", 64))
 
         self.play_btn.setEnabled(True)
         self.prev_btn.setEnabled(True)
         self.next_btn.setEnabled(True)
-
         self._update_status()
 
     def _on_state_changed(self, state: str) -> None:
@@ -326,8 +307,6 @@ class TaskbarWidget(QWidget):
         if available:
             self._update_status("Подключено")
             QTimer.singleShot(500, self._refresh_status)
-            # Синхронизируем слайдер громкости с реальной громкостью
-            # приложения при первом подключении
             if self._volume_ctl is None:
                 self._volume_ctl = self._find_yandex_audio_volume()
                 if self._volume_ctl is not None:
@@ -344,7 +323,7 @@ class TaskbarWidget(QWidget):
             self.title_lbl.setText("Нет воспроизведения")
             self.artist_lbl.setText("Запустите приложение Яндекс Музыки")
             self.app_lbl.setText("")
-            self.cover_lbl.setPixmap(make_placeholder_cover())
+            self.cover_lbl.setPixmap(make_placeholder_cover("♪", 64))
             self.play_btn.setIcon(svg_to_icon(SVG_PLAY, 20, color="#FFFFFF"))
             self.play_btn.setEnabled(False)
             self.prev_btn.setEnabled(False)
@@ -358,7 +337,6 @@ class TaskbarWidget(QWidget):
     # ------------------------------------------------------------------ #
     #  Обработчики UI
     # ------------------------------------------------------------------ #
-
     def _user_seek(self, val: bool) -> None:
         self._user_seeking = val
 
@@ -409,7 +387,6 @@ class TaskbarWidget(QWidget):
 
         found_names: list[str] = []
         candidate = None
-
         for s in sessions:
             if not s.Process:
                 continue
@@ -423,7 +400,6 @@ class TaskbarWidget(QWidget):
                 candidate = s
                 break
 
-        # Fallback: ровно одна не-системная сессия → используем её
         if candidate is None:
             non_system = []
             for s in sessions:
@@ -465,16 +441,15 @@ class TaskbarWidget(QWidget):
             self._last_volume = self.volume_slider.value()
             self.volume_slider.setValue(0)
         else:
-            self.volume_slider.setValue(getattr(self, "_last_volume", 70))
+            self.volume_slider.setValue(self._last_volume or 70)
 
     # ------------------------------------------------------------------ #
     #  Обложка
     # ------------------------------------------------------------------ #
-
     def _set_cover_from_bytes(self, data: bytes) -> None:
         img = QImage()
         if not img.loadFromData(data):
-            self.cover_lbl.setPixmap(make_placeholder_cover())
+            self.cover_lbl.setPixmap(make_placeholder_cover("♪", 64))
             return
         pixmap = QPixmap.fromImage(img).scaled(
             64, 64,
@@ -499,7 +474,6 @@ class TaskbarWidget(QWidget):
     # ------------------------------------------------------------------ #
     #  Хелперы
     # ------------------------------------------------------------------ #
-
     def _update_status(self, text: Optional[str] = None) -> None:
         self.status_lbl.setText(text if text is not None else "")
 
@@ -540,7 +514,6 @@ class TaskbarWidget(QWidget):
     # ------------------------------------------------------------------ #
     #  Позиционирование и перетаскивание
     # ------------------------------------------------------------------ #
-
     def _position_near_taskbar(self) -> None:
         screen = QApplication.primaryScreen().availableGeometry()
         x = screen.right() - self.WIDTH - 12
@@ -564,7 +537,6 @@ class TaskbarWidget(QWidget):
     # ------------------------------------------------------------------ #
     #  Показ/скрытие
     # ------------------------------------------------------------------ #
-
     def show_widget(self) -> None:
         if not self.isVisible():
             self.setWindowOpacity(0.0)
